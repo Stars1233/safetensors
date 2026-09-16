@@ -24,7 +24,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::num::NonZeroUsize;
-use std::ops::Bound;
+use std::ops::{Bound, Range};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -653,13 +653,46 @@ impl Version {
 
 const PREFETCH_THREADS: usize = 8;
 
+/// What one span is handed out as: its tensor's name and dtype, and the
+/// shape after row slicing.
+#[derive(Clone)]
+struct SpanMeta {
+    name: String,
+    dtype: Dtype,
+    shape: Vec<usize>,
+}
+
+/// A running background load, see [`Open::prefetch`].
+struct Prefetch {
+    loader: Loader,
+    /// per span, aligned with the spans given to `loader`
+    spans: Vec<SpanMeta>,
+    /// tensor name -> span index
+    index_map: HashMap<String, usize>,
+}
+
+impl Prefetch {
+    /// Takes the span loaded for `name`, once
+    fn take_tensor(&self, py: Python<'_>, name: &str) -> PyResult<(DeviceBuffer, &SpanMeta)> {
+        let &idx = self.index_map.get(name).ok_or_else(|| {
+            SafetensorError::new_err(format!("tensor {name} is not in the prefetch plan"))
+        })?;
+
+        let buffer = py
+            .detach(|| self.loader.take_tensor(idx))
+            .map_err(|e| SafetensorError::new_err(format!("{name}: {e}")))?;
+
+        Ok((buffer, &self.spans[idx]))
+    }
+}
+
 struct Open {
     metadata: Metadata,
     offset: usize,
     framework: Framework,
     device: Device,
     storage: Arc<Storage>,
-    prefetch_loader: Option<Loader>,
+    prefetch: Option<Prefetch>,
 }
 
 impl Open {
@@ -668,7 +701,6 @@ impl Open {
         framework: Framework,
         device: Option<Device>,
         backend: Backend,
-        prefetch: bool,
     ) -> PyResult<Self> {
         let file = File::open(&filename).map_err(|_| {
             PyFileNotFoundError::new_err(format!(
@@ -714,56 +746,15 @@ impl Open {
             Ok(())
         })?;
 
-        if prefetch && backend != Backend::Pread {
-            return Err(SafetensorError::new_err(
-                "prefetch is only compatible with backend=\"pread\"",
-            ));
-        }
-        if prefetch && framework != Framework::Pytorch {
-            return Err(SafetensorError::new_err(
-                "prefetch is only compatible with framework=\"pt\"",
-            ));
-        }
-
         if backend == Backend::Pread {
             disable_page_cache_macos(&file);
-
-            let file = Arc::new(file);
-            let prefetch_loader = if prefetch {
-                let Device::Cuda(device_idx) = device else {
-                    return Err(SafetensorError::new_err(
-                        "prefetch is only compatible with cuda devices",
-                    ));
-                };
-                // Every tensor is handed out through DLPack (natively or as a
-                // uint8 view); refuse dtypes torch cannot represent before any
-                // device memory is committed.
-                if let Some(info) = metadata.tensor_infos().iter().find(|info| {
-                    !dlpack::dlpack_supported_native(info.dtype)
-                        && dlpack::torch_view_target(info.dtype).is_none()
-                }) {
-                    return Err(SafetensorError::new_err(format!(
-                        "prefetch cannot hand out dtype {:?}: torch has no matching dtype",
-                        info.dtype
-                    )));
-                }
-                Some(Loader::load(
-                    file.clone(),
-                    &metadata,
-                    offset,
-                    device_idx as i32,
-                    PREFETCH_THREADS,
-                )?)
-            } else {
-                None
-            };
             return Ok(Self {
                 metadata,
                 offset,
                 framework,
                 device,
-                storage: Arc::new(Storage::Pread(file)),
-                prefetch_loader,
+                storage: Arc::new(Storage::Pread(Arc::new(file))),
+                prefetch: None,
             });
         }
 
@@ -866,7 +857,7 @@ impl Open {
             framework,
             device,
             storage,
-            prefetch_loader: None,
+            prefetch: None,
         })
     }
 
@@ -899,6 +890,179 @@ impl Open {
         Ok(self.metadata.offset_keys())
     }
 
+    /// Start loading tensors to the device in the background; see `safe_open.prefetch`.
+    pub fn prefetch(&mut self, plan: Option<&PyBound<'_, PyDict>>) -> PyResult<()> {
+        if self.prefetch.is_some() {
+            return Err(SafetensorError::new_err(
+                "prefetch was already called on this handle",
+            ));
+        }
+
+        if self.framework != Framework::Pytorch {
+            return Err(SafetensorError::new_err(
+                "prefetch is only compatible with framework=\"pt\"",
+            ));
+        }
+
+        let Storage::Pread(file) = &*self.storage else {
+            return Err(SafetensorError::new_err(
+                "prefetch is only compatible with backend=\"pread\"",
+            ));
+        };
+
+        let Device::Cuda(device_idx) = &self.device else {
+            return Err(SafetensorError::new_err(
+                "prefetch is only compatible with cuda devices",
+            ));
+        };
+
+        let device_idx = *device_idx as i32;
+        let rows_of = match plan {
+            Some(plan) => Some(self.parse_plan(plan)?),
+            None => None,
+        };
+
+        let mut spans = Vec::new();
+        let mut metas = Vec::new();
+        let mut index_map = HashMap::new();
+        for name in self.metadata.offset_keys() {
+            let rows = match &rows_of {
+                None => None,
+                Some(rows_of) => match rows_of.get(&name) {
+                    None => continue,
+                    Some(rows) => rows.clone(),
+                },
+            };
+
+            let info = self.metadata.info(&name).ok_or_else(|| {
+                SafetensorError::new_err(format!("File does not contain tensor {name}"))
+            })?;
+
+            if !dlpack::dlpack_supported_native(info.dtype)
+                && dlpack::torch_view_target(info.dtype).is_none()
+            {
+                return Err(SafetensorError::new_err(format!(
+                    "prefetch cannot hand out dtype {:?}: torch has no matching dtype",
+                    info.dtype
+                )));
+            }
+
+            let (start, end) = info.data_offsets;
+            let mut shape = info.shape.clone();
+            let span = match rows {
+                None => Span { start, end },
+                Some(rows) => {
+                    // `parse_plan` checked that rows are whole bytes of a >= 1-d tensor
+                    let row_bytes = (end - start).checked_div(shape[0]).unwrap_or(0);
+                    shape[0] = rows.len();
+                    Span {
+                        start: start + rows.start * row_bytes,
+                        end: start + rows.end * row_bytes,
+                    }
+                }
+            };
+            index_map.insert(name.clone(), spans.len());
+            spans.push(span);
+            metas.push(SpanMeta {
+                name,
+                dtype: info.dtype,
+                shape,
+            });
+        }
+
+        if rows_of.is_some() && spans.is_empty() {
+            return Err(SafetensorError::new_err("prefetch plan selects no tensors"));
+        }
+        let loader = Loader::load(
+            file.clone(),
+            self.offset,
+            device_idx,
+            PREFETCH_THREADS,
+            spans,
+        )?;
+        self.prefetch = Some(Prefetch {
+            loader,
+            spans: metas,
+            index_map,
+        });
+        Ok(())
+    }
+
+    /// Validates a prefetch plan into `name -> rows`, `None` meaning the whole tensor.
+    fn parse_plan(
+        &self,
+        plan: &PyBound<'_, PyDict>,
+    ) -> PyResult<HashMap<String, Option<Range<usize>>>> {
+        let mut rows_of = HashMap::with_capacity(plan.len());
+        for (key, value) in plan.iter() {
+            let name: String = key
+                .extract()
+                .map_err(|_| SafetensorError::new_err("prefetch plan keys must be tensor names"))?;
+
+            let info = self.metadata.info(&name).ok_or_else(|| {
+                SafetensorError::new_err(format!("File does not contain tensor {name}"))
+            })?;
+
+            if value.is_none() {
+                rows_of.insert(name, None);
+                continue;
+            }
+
+            let slice = value.cast::<PySlice>().map_err(|_| {
+                SafetensorError::new_err(format!(
+                    "prefetch plan values must be None or a slice, got {} for {name}",
+                    value.get_type()
+                ))
+            })?;
+
+            let Some(&n_rows) = info.shape.first() else {
+                return Err(SafetensorError::new_err(format!(
+                    "cannot slice rows of the 0-d tensor {name}"
+                )));
+            };
+
+            for attr in ["start", "stop"] {
+                let bound = slice.getattr(attr)?;
+                if bound.is_none() {
+                    continue;
+                }
+                let v: isize = bound.extract().map_err(|_| {
+                    SafetensorError::new_err(format!(
+                        "prefetch plan slice bounds for {name} must be integers or None"
+                    ))
+                })?;
+                // Python would clamp silently; a plan that misses the tensor is a bug
+                if v > n_rows as isize || v < -(n_rows as isize) {
+                    return Err(SafetensorError::new_err(format!(
+                        "prefetch plan slice {attr} {v} for {name} is out of range for {n_rows} rows"
+                    )));
+                }
+            }
+            let idx = slice.indices(n_rows as isize).map_err(|e| {
+                SafetensorError::new_err(format!("invalid prefetch plan slice for {name}: {e}"))
+            })?;
+            if idx.step != 1 {
+                return Err(SafetensorError::new_err(format!(
+                    "prefetch plan slices must have step 1, got {} for {name}",
+                    idx.step
+                )));
+            }
+
+            let nbytes = info.data_offsets.1 - info.data_offsets.0;
+            let row_bytes = nbytes.checked_div(n_rows).unwrap_or(0);
+            if row_bytes * n_rows != nbytes {
+                return Err(SafetensorError::new_err(format!(
+                    "cannot slice rows of {name}: a row is not a whole number of bytes"
+                )));
+            }
+
+            let start = idx.start as usize;
+            rows_of.insert(name, Some(start..start + idx.slicelength));
+        }
+
+        Ok(rows_of)
+    }
+
     /// Returns a full tensor
     ///
     /// Args:
@@ -921,20 +1085,15 @@ impl Open {
             SafetensorError::new_err(format!("File does not contain tensor {name}",))
         })?;
 
-        if let Some(loader) = self.prefetch_loader.as_ref() {
-            let idx = self.metadata.tensor_idx(name).ok_or_else(|| {
-                SafetensorError::new_err(format!("File does not contain tensor {name}",))
-            })?;
+        if let Some(prefetch) = self.prefetch.as_ref() {
             return Python::attach(|py| {
-                let buffer = py
-                    .detach(|| loader.take_tensor(idx))
-                    .map_err(|e| SafetensorError::new_err(format!("{name}: {e}")))?;
+                let (buffer, meta) = prefetch.take_tensor(py, name)?;
                 match buffer {
                     DeviceBuffer::Cuda(buffer) => cuda_tensor_from_buffer(
                         py,
                         &self.framework,
-                        info.dtype,
-                        &info.shape,
+                        meta.dtype,
+                        &meta.shape,
                         buffer,
                     ),
                 }
@@ -1322,6 +1481,11 @@ impl Open {
     /// torch via DLPack (1x model memory, the MTLBuffer is the destination).
     /// The `mmap` backend uses the sequential loop, reading through the mmap.
     pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
+        if self.prefetch.is_some() {
+            return Err(SafetensorError::new_err(
+                "get_tensors is not available after prefetch(); use tensor_stream()",
+            ));
+        }
         // The bulk parallel-pread path is gated on the `pread` backend so the
         // `backend` choice is honored: `mmap` falls through to the per-tensor
         // loop below, which reads through the mmap via `get_tensor_mps`.
@@ -1416,6 +1580,11 @@ impl Open {
     ///     tensor_part = f.get_slice("embedding")[:, ::8]
     /// ```
     pub fn get_slice(&self, name: &str) -> PyResult<PySafeSlice> {
+        if self.prefetch.is_some() {
+            return Err(SafetensorError::new_err(
+                "get_slice is not available after prefetch(); use get_tensor_meta for shapes and get_tensor for data",
+            ));
+        }
         if let Some(info) = self.metadata.info(name) {
             Ok(PySafeSlice {
                 info: info.clone(),
@@ -1431,19 +1600,27 @@ impl Open {
         }
     }
 
+    /// A tensor's header entry.
+    pub fn get_tensor_meta(&self, name: &str) -> PyResult<TensorMeta> {
+        let info = self.metadata.info(name).ok_or_else(|| {
+            SafetensorError::new_err(format!("File does not contain tensor {name}"))
+        })?;
+        Ok(TensorMeta {
+            dtype: info.dtype.to_string(),
+            shape: info.shape.clone(),
+            data_offsets: info.data_offsets,
+        })
+    }
+
     pub fn tensor_stream(&self) -> PyResult<TensorStream> {
-        let Some(loader) = self.prefetch_loader.as_ref() else {
+        let Some(prefetch) = self.prefetch.as_ref() else {
             return Err(SafetensorError::new_err(
-                "`tensor_stream` requires `safe_open(..., prefetch=True)`",
+                "`tensor_stream` requires `prefetch()` to have been called",
             ));
         };
-        let names = self.metadata.offset_keys();
-        let infos = self.metadata.tensor_infos().to_vec();
-
         Ok(TensorStream {
-            iter: loader.iter(),
-            names,
-            infos,
+            iter: prefetch.loader.iter(),
+            entries: prefetch.spans.clone(),
             framework: self.framework.clone(),
             _keepalive: None,
         })
@@ -1461,8 +1638,8 @@ impl From<LoaderError> for PyErr {
 #[pyclass]
 pub struct TensorStream {
     iter: TensorIter,
-    names: Vec<String>,
-    infos: Vec<TensorInfo>,
+    /// per span, aligned with the loader's spans
+    entries: Vec<SpanMeta>,
     framework: Framework,
     _keepalive: Option<Py<PyAny>>,
 }
@@ -1478,17 +1655,17 @@ impl TensorStream {
             None => Ok(None),
             Some(Err(e)) => Err(e.into()),
             Some(Ok((idx, buffer))) => {
-                let info = &self.infos[idx];
+                let meta = &mut self.entries[idx];
                 let tensor = match buffer {
                     DeviceBuffer::Cuda(buffer) => cuda_tensor_from_buffer(
                         py,
                         &self.framework,
-                        info.dtype,
-                        &info.shape,
+                        meta.dtype,
+                        &meta.shape,
                         buffer,
                     )?,
                 };
-                Ok(Some((std::mem::take(&mut self.names[idx]), tensor)))
+                Ok(Some((std::mem::take(&mut meta.name), tensor)))
             }
         }
     }
@@ -1513,17 +1690,6 @@ impl TensorStream {
 ///         On Apple-silicon MPS, prefer `"pread"`: it reads straight into
 ///         shared `MTLBuffer`s (1x model memory, no page-cache duplication) and
 ///         loads a full model several times faster than `"mmap"`.
-///
-///     prefetch (`bool`, *keyword-only*, defaults to `False`):
-///         Requires `backend="pread"`, `framework="pt"` and a CUDA device for the moment.
-///         Starts loading the whole file to the device in the background at
-///         open, and hands each tensor out exactly once as a zero-copy view:
-///         via `get_tensor` or `tensor_stream()`, whichever asks first.
-///         Consume inside the `with` block — closing the file stops the load.
-///         Each open file runs 8 reader threads and holds its full data size
-///         in device memory until its tensors are consumed; all files share
-///         one process-wide 512 MiB pinned staging pool. Raises at open if the
-///         file holds a dtype torch cannot represent (F6).
 #[pyclass]
 #[allow(non_camel_case_types)]
 struct safe_open {
@@ -1538,21 +1704,53 @@ impl safe_open {
             .ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))?;
         Ok(inner)
     }
+
+    fn inner_mut(&mut self) -> PyResult<&mut Open> {
+        let inner = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))?;
+        Ok(inner)
+    }
 }
 
 #[pymethods]
 impl safe_open {
     #[new]
-    #[pyo3(signature = (filename, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap, prefetch=false))]
+    #[pyo3(signature = (filename, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap))]
     fn new(
         filename: PathBuf,
         framework: Framework,
         device: Option<Device>,
         backend: Backend,
-        prefetch: bool,
     ) -> PyResult<Self> {
-        let inner = Some(Open::new(filename, framework, device, backend, prefetch)?);
+        let inner = Some(Open::new(filename, framework, device, backend)?);
         Ok(Self { inner })
+    }
+
+    /// Start loading the file's tensors to the device in the background.
+    ///
+    /// Requires `framework="pt"`, `backend="pread"` and a CUDA `device`, and
+    /// may be called once per handle. Afterwards `get_tensor` hands each
+    /// tensor out exactly once as a zero-copy view of device memory and
+    /// `tensor_stream()` yields them as they land. Memory is held until the
+    /// handle is closed, so consume inside the `with` block. Each open file
+    /// runs 8 reader threads; all files share one process-wide 512 MiB pinned
+    /// staging pool.
+    ///
+    /// Args:
+    ///     plan (`Dict[str, Optional[slice]]`, *optional*):
+    ///         Which tensors to load: keys are tensor names, values `None` for
+    ///         the whole tensor or a step-1 `slice` along its first dimension.
+    ///         Tensors absent from the plan are not loaded and cannot be
+    ///         fetched from this handle. `None` (the default) loads every
+    ///         tensor whole.
+    ///
+    /// Raises if a planned tensor has a dtype torch cannot represent (F6), if a
+    /// slice has a step other than 1, or if a sliced tensor is 0-d.
+    #[pyo3(signature = (plan=None))]
+    pub fn prefetch(&mut self, plan: Option<&PyBound<'_, PyDict>>) -> PyResult<()> {
+        self.inner_mut()?.prefetch(plan)
     }
 
     /// Return the special non tensor information in the header
@@ -1573,6 +1771,20 @@ impl safe_open {
         self.inner()?.keys()
     }
 
+    /// Returns a tensor's header entry without reading any data.
+    ///
+    /// Args:
+    ///     name (`str`):
+    ///         The name of the tensor
+    ///
+    /// Returns:
+    ///     (`TensorMeta`):
+    ///         `dtype` (safetensors name, e.g. `"F32"`), `shape` and `data_offsets`
+    ///         as written in the file header.
+    pub fn get_tensor_meta(&self, name: &str) -> PyResult<TensorMeta> {
+        self.inner()?.get_tensor_meta(name)
+    }
+
     /// Returns the names of the tensors in the file, ordered by offset.
     ///
     /// Returns:
@@ -1591,7 +1803,7 @@ impl safe_open {
     /// Returns:
     ///     (`Tensor`):
     ///         The tensor in the framework you opened the file for.
-    ///         With `prefetch=True` each tensor can be taken once; asking
+    ///         After `prefetch()` each tensor can be taken once; asking
     ///         again (or after `tensor_stream()` yielded it) raises.
     ///
     /// Example:
@@ -1648,8 +1860,8 @@ impl safe_open {
 
     /// Iterates over every tensor as `(name, tensor)` while the file loads.
     ///
-    /// Requires `prefetch=True`. Tensors are yielded as soon as their bytes
-    /// are on the device, so the order is unspecified.
+    /// Requires `prefetch()` to have been called. Tensors are yielded as soon as
+    /// their bytes are on the device, so the order is unspecified.
     /// Each tensor is delivered once: names already taken with `get_tensor`
     /// are skipped. Iterate inside the `with` block — after the file is
     /// closed the next step raises.
@@ -1665,9 +1877,8 @@ impl safe_open {
     /// ```python
     /// from safetensors import safe_open
     ///
-    /// with safe_open(
-    ///     "model.safetensors", framework="pt", device=0, backend="pread", prefetch=True
-    /// ) as f:
+    /// with safe_open("model.safetensors", framework="pt", device=0, backend="pread") as f:
+    ///     f.prefetch()
     ///     for name, tensor in f.tensor_stream():
     ///         ...
     /// ```
@@ -1688,6 +1899,23 @@ impl safe_open {
     }
 }
 
+/// A tensor's header entry, as written in the file.
+#[pyclass(frozen, get_all)]
+#[derive(Debug)]
+pub struct TensorMeta {
+    dtype: String,
+    shape: Vec<usize>,
+    /// `(start, end)` of the tensor's bytes within the data section
+    data_offsets: (usize, usize),
+}
+
+#[pymethods]
+impl TensorMeta {
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
 #[pyclass]
 struct PySafeSlice {
     info: TensorInfo,
@@ -1699,7 +1927,7 @@ struct PySafeSlice {
 
 use std::fmt;
 
-use crate::engine::{CudaBuffer, DeviceBuffer, Loader, LoaderError, TensorIter};
+use crate::engine::{CudaBuffer, DeviceBuffer, Loader, LoaderError, Span, TensorIter};
 
 struct Disp(Vec<TensorIndexer>);
 
@@ -2663,18 +2891,25 @@ impl _safe_open_handle {
             .ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))?;
         Ok(inner)
     }
+
+    fn inner_mut(&mut self) -> PyResult<&mut Open> {
+        let inner = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| SafetensorError::new_err("File is closed".to_string()))?;
+        Ok(inner)
+    }
 }
 
 #[pymethods]
 impl _safe_open_handle {
     #[new]
-    #[pyo3(signature = (f, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap, prefetch=false))]
+    #[pyo3(signature = (f, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap))]
     fn new(
         f: Py<PyAny>,
         framework: Framework,
         device: Option<Device>,
         backend: Backend,
-        prefetch: bool,
     ) -> PyResult<Self> {
         let filename = Python::attach(|py| -> PyResult<PathBuf> {
             let _ = f.getattr(py, "fileno")?;
@@ -2682,8 +2917,14 @@ impl _safe_open_handle {
             let filename: PathBuf = filename.extract(py)?;
             Ok(filename)
         })?;
-        let inner = Some(Open::new(filename, framework, device, backend, prefetch)?);
+        let inner = Some(Open::new(filename, framework, device, backend)?);
         Ok(Self { inner })
+    }
+
+    /// See `safe_open.prefetch`.
+    #[pyo3(signature = (plan=None))]
+    pub fn prefetch(&mut self, plan: Option<&PyBound<'_, PyDict>>) -> PyResult<()> {
+        self.inner_mut()?.prefetch(plan)
     }
 
     /// Return the special non tensor information in the header
@@ -2704,6 +2945,21 @@ impl _safe_open_handle {
         self.inner()?.keys()
     }
 
+    /// Returns a tensor's header entry without reading any data.
+    ///
+    /// Args:
+    ///     name (`str`):
+    ///         The name of the tensor
+    ///
+    /// Returns:
+    ///     (`TensorMeta`):
+    ///         `dtype` (safetensors name, e.g. `"F32"`), `shape` and `data_offsets`
+    ///         as written in the file header. Works on every backend, including
+    ///         after `prefetch()`.
+    pub fn get_tensor_meta(&self, name: &str) -> PyResult<TensorMeta> {
+        self.inner()?.get_tensor_meta(name)
+    }
+
     /// Returns the names of the tensors in the file, ordered by offset.
     ///
     /// Returns:
@@ -2722,7 +2978,7 @@ impl _safe_open_handle {
     /// Returns:
     ///     (`Tensor`):
     ///         The tensor in the framework you opened the file for.
-    ///         With `prefetch=True` each tensor can be taken once; asking
+    ///         After `prefetch()` each tensor can be taken once; asking
     ///         again (or after `tensor_stream()` yielded it) raises.
     ///
     /// Example:
@@ -2789,6 +3045,8 @@ fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(deserialize, m)?)?;
     m.add_class::<TensorStream>()?;
     m.add_class::<TensorSpec>()?;
+    m.add_class::<TensorMeta>()?;
+    m.add_class::<PySafeSlice>()?;
     m.add_class::<safe_open>()?;
     m.add_class::<_safe_open_handle>()?;
     m.add("SafetensorError", m.py().get_type::<SafetensorError>())?;
