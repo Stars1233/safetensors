@@ -1733,8 +1733,9 @@ impl safe_open {
     /// Requires `framework="pt"`, `backend="pread"` and a CUDA `device`, and
     /// may be called once per handle. Afterwards `get_tensor` hands each
     /// tensor out exactly once as a zero-copy view of device memory and
-    /// `tensor_stream()` yields them as they land. Memory is held until the
-    /// handle is closed, so consume inside the `with` block. Each open file
+    /// `tensor_stream()` yields them as they land. An allocation's memory is
+    /// freed once every tensor in it has been taken and dropped; allocations
+    /// with untaken tensors are held until the handle is closed. Each open file
     /// runs 8 reader threads; all files share one process-wide 512 MiB pinned
     /// staging pool.
     ///
@@ -2489,6 +2490,12 @@ fn cuda_tensor_from_buffer(
     if buffer.len() == 0 {
         return torch_empty_cuda(py, torch, dtype, &storage_shape, buffer.device());
     }
+
+    let stream: u64 = torch
+        .getattr(intern!(py, "_C"))?
+        .call_method1(intern!(py, "_cuda_getCurrentRawStream"), (buffer.device(),))?
+        .extract()?;
+    buffer.consumed_on(stream);
     let device = dlpack::cuda_device(buffer.device());
     // Tensors are views at their packed file offset inside a shared allocation,
     // which may be misaligned for the element type: stage through a flat uint8

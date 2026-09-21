@@ -1,5 +1,5 @@
 use std::{
-    ffi::{c_char, c_int, c_uint, c_void, CStr, CString},
+    ffi::{c_char, c_int, c_uint, c_ulonglong, c_void, CStr, CString},
     sync::OnceLock,
 };
 
@@ -71,9 +71,22 @@ impl std::fmt::Display for CudaError {
 
 impl std::error::Error for CudaError {}
 
+type PrimaryCtxGetState = unsafe extern "C" fn(c_int, *mut c_uint, *mut c_int) -> c_int;
+// cudaGetDriverEntryPointByVersion (CUDA >= 12.5; the only form left in 13) and
+// cudaGetDriverEntryPoint (11.3 .. 12.x): resolve a driver symbol through the runtime
+type EntryPointByVersion =
+    unsafe extern "C" fn(*const c_char, *mut *mut c_void, c_uint, c_ulonglong, *mut c_int) -> Err;
+type EntryPoint =
+    unsafe extern "C" fn(*const c_char, *mut *mut c_void, c_ulonglong, *mut c_int) -> Err;
+
 pub struct CudaApi {
     f: Fns,
     err_str: GetErrorString,
+    /// The driver's `cuDevicePrimaryCtxGetState`, obtained through the
+    /// runtime's driver entry-point API: whether a device already has a primary
+    /// context, so that selecting it creates nothing. Required: a runtime that
+    /// cannot provide it (< 11.3) is not attached.
+    primary_ctx_active: PrimaryCtxGetState,
 }
 
 // SAFETY: immutable fn pointers + CUDA runtime API is thread safe
@@ -181,8 +194,14 @@ impl CudaApi {
         self.check(unsafe { (self.f.cudaStreamWaitEvent)(s, e, 0) })
     }
 
-    fn set_device(&self, d: i32) -> Result<(), CudaError> {
+    pub fn set_device(&self, d: i32) -> Result<(), CudaError> {
         self.check(unsafe { (self.f.cudaSetDevice)(d) })
+    }
+
+    /// Whether `device` already has a primary context.
+    fn device_is_initialised(&self, device: i32) -> bool {
+        let (mut flags, mut active) = (0, 0);
+        unsafe { (self.primary_ctx_active)(device, &mut flags, &mut active) == 0 && active != 0 }
     }
 
     pub fn with_device<T, E: From<CudaError>>(
@@ -192,11 +211,14 @@ impl CudaApi {
     ) -> Result<T, E> {
         let mut prev = 0;
         self.check(unsafe { (self.f.cudaGetDevice)(&mut prev) })?;
+        // selecting a device without a primary context would create one
+        let restore = prev != device && self.device_is_initialised(prev);
         self.set_device(device)?;
         let guard = DeviceGuard {
             api: self,
             device,
             prev,
+            restore,
             _thread_bound: std::marker::PhantomData,
         };
         cb(&guard)
@@ -235,6 +257,7 @@ pub struct DeviceGuard<'a> {
     api: &'a CudaApi,
     device: i32,
     prev: c_int,
+    restore: bool,
     /// `cudaSetDevice` is per-thread state: the guard must be dropped on the
     /// thread that created it, so it is `!Send` (raw pointers are `!Send`).
     _thread_bound: std::marker::PhantomData<*mut ()>,
@@ -260,7 +283,9 @@ impl DeviceGuard<'_> {
 
 impl Drop for DeviceGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.api.set_device(self.prev);
+        if self.restore {
+            let _ = self.api.set_device(self.prev);
+        }
     }
 }
 
@@ -314,9 +339,38 @@ pub fn api() -> Option<&'static CudaApi> {
         if p.is_null() {
             return None;
         }
+        let driver_symbol = |sym: &str| -> *mut c_void {
+            let name = CString::new(sym).unwrap();
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            let by_version = CString::new("cudaGetDriverEntryPointByVersion").unwrap();
+            let p = libc::dlsym(h, by_version.as_ptr());
+            if !p.is_null() {
+                // 12000: the CUDA 12.0 ABI; neither symbol has a newer revision
+                let get = std::mem::transmute::<*mut c_void, EntryPointByVersion>(p);
+                if get(name.as_ptr(), &mut ptr, 12000, 0, std::ptr::null_mut()) != 0 {
+                    ptr = std::ptr::null_mut();
+                }
+            }
+            if ptr.is_null() {
+                let legacy = CString::new("cudaGetDriverEntryPoint").unwrap();
+                let p = libc::dlsym(h, legacy.as_ptr());
+                if !p.is_null() {
+                    let get = std::mem::transmute::<*mut c_void, EntryPoint>(p);
+                    if get(name.as_ptr(), &mut ptr, 0, std::ptr::null_mut()) != 0 {
+                        ptr = std::ptr::null_mut();
+                    }
+                }
+            }
+            ptr
+        };
+        let primary = driver_symbol("cuDevicePrimaryCtxGetState");
+        if primary.is_null() {
+            return None;
+        }
         CudaApi {
             f,
             err_str: std::mem::transmute::<*mut c_void, GetErrorString>(p),
+            primary_ctx_active: std::mem::transmute::<*mut c_void, PrimaryCtxGetState>(primary),
         }
     };
     let _ = API.set(api);
