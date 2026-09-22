@@ -91,7 +91,7 @@ impl Display for LoaderError {
         match self {
             Self::AlreadyDelivered => write!(
                 f,
-                "tensor already delivered (prefetch hands each tensor out once, via get_tensor or tensor_stream)"
+                "tensor already delivered (prefetch hands each tensor out once, via take or iteration)"
             ),
             Self::Closed => write!(f, "prefetch loader closed"),
             Self::Cuda(e) => write!(f, "{e}"),
@@ -769,7 +769,6 @@ impl Loader {
         if !(0..MAX_DEVICES as i32).contains(&device) {
             return Err(LoaderError::InvalidDevice(device));
         }
-        let threads = threads.max(1);
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
@@ -785,6 +784,8 @@ impl Loader {
             CHUNK_SIZE,
             MIN_ALLOCATION_SIZE,
         ));
+        // avoid spawning too many threads when not needed, up to chunks.len()
+        let threads = threads.clamp(1, plan.chunks.len().max(1));
         let pool = cuda_api.with_device(device, |_| pool(cuda_api))?;
         let inner = Arc::new(LoaderInner {
             file,
